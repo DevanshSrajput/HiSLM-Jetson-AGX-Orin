@@ -1,272 +1,325 @@
-from __future__ import annotations
+"""
+server.py — Run on AGX Orin (30GB)
+====================================
+Parent node. Hosts:
+  - WebSocket endpoint  (/ws)
+  - REST fallback       (POST /send, GET /messages)
+  - Static UI           (GET / → index.html)
+  - Health check        (GET /health)
+
+Start:
+  python server.py
+
+Then open http://<AGX_IP>:8000 in a browser on either device.
+"""
 
 import asyncio
 import json
 import logging
 import os
-import subprocess
+import sys
 import uuid
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from time import perf_counter
-from typing import Any
-from concurrent.futures import ThreadPoolExecutor
+from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel
 
-
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_PATH = BASE_DIR / "qwen2.5-3b-instruct-q4_k_m.gguf"
-DEFAULT_LLAMACLI_PATH = BASE_DIR / "llama.cpp" / "build" / "bin" / "llama-cli"
-
-# Shell wrapper path — solves LD_LIBRARY_PATH for subprocess reliably
-WRAPPER_SCRIPT = BASE_DIR / "run_llama.sh"
-
+# ─────────────────────────────────────────────
+# Logging setup
+# ─────────────────────────────────────────────
+LOG_FORMAT = "%(asctime)s  [%(levelname)-8s]  %(name)s — %(message)s"
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.DEBUG,
+    format=LOG_FORMAT,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("server.log", mode="a"),
+    ],
 )
-logger = logging.getLogger("llama_inference_server")
+log = logging.getLogger("AGX-SERVER")
 
+# ─────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────
+HOST = "0.0.0.0"
+PORT = 8000
+MAX_HISTORY = 200          # messages kept in memory
+PING_INTERVAL = 20         # WebSocket keepalive ping interval (seconds)
 
-# ── Write wrapper script on first import ────────────────────────────────────
-def _ensure_wrapper(llama_cli_path: Path) -> Path:
-    """
-    Write a shell wrapper that sets LD_LIBRARY_PATH before exec-ing llama-cli.
-    This is the most reliable way to inject env vars for a subprocess — Python's
-    env= dict works for most cases but the dynamic linker on Jetson reads
-    LD_LIBRARY_PATH at exec time, so we need it set in the shell that calls exec.
-    """
-    script = f"""#!/bin/bash
-export LD_LIBRARY_PATH=/home/nvidia/.local/lib/python3.10/site-packages/nvidia/cusparselt/lib:$LD_LIBRARY_PATH
-exec {llama_cli_path} "$@"
-"""
-    WRAPPER_SCRIPT.write_text(script)
-    WRAPPER_SCRIPT.chmod(0o755)
-    logger.info("wrapper script written: %s", WRAPPER_SCRIPT)
-    return WRAPPER_SCRIPT
+# ─────────────────────────────────────────────
+# Data models
+# ─────────────────────────────────────────────
+class Message(BaseModel):
+    id: str
+    sender: str            # "agx" | "nx" | device hostname
+    role: str              # "user" | "server"  (server = AGX operator)
+    text: str
+    timestamp: str         # ISO-8601 UTC
 
+class SendRequest(BaseModel):
+    sender: str
+    text: str
 
-class QueryRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    prompt: str = Field(min_length=1)
-    sensor: dict[str, Any] | None = None
+# ─────────────────────────────────────────────
+# In-memory message store
+# ─────────────────────────────────────────────
+message_history: List[dict] = []
 
+def make_message(sender: str, role: str, text: str) -> dict:
+    msg = {
+        "id": str(uuid.uuid4()),
+        "sender": sender,
+        "role": role,
+        "text": text,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    message_history.append(msg)
+    if len(message_history) > MAX_HISTORY:
+        message_history.pop(0)
+    log.info(f"[MSG STORED] sender={sender} role={role} text={text[:80]!r}")
+    return msg
 
-@dataclass(frozen=True)
-class ServerConfig:
-    model_path: Path
-    llama_cli_path: Path
-    wrapper_path: Path
-    timeout_seconds: float | None = 300.0
+# ─────────────────────────────────────────────
+# WebSocket connection manager
+# ─────────────────────────────────────────────
+class ConnectionManager:
+    def __init__(self):
+        self.active: dict[str, WebSocket] = {}   # client_id → websocket
 
-    @classmethod
-    def from_env(cls) -> "ServerConfig":
-        model_path = _resolve_path(os.getenv("MODEL_PATH", str(DEFAULT_MODEL_PATH)))
-        llama_cli_path = _resolve_path(os.getenv("LLAMA_CLI_PATH", str(DEFAULT_LLAMACLI_PATH)))
-        wrapper_path = _ensure_wrapper(llama_cli_path)
-        timeout_seconds = _read_optional_timeout("LLAMA_CLI_TIMEOUT_SECONDS", 300.0)
-        return cls(
-            model_path=model_path,
-            llama_cli_path=llama_cli_path,
-            wrapper_path=wrapper_path,
-            timeout_seconds=timeout_seconds,
-        )
+    async def connect(self, client_id: str, ws: WebSocket):
+        await ws.accept()
+        self.active[client_id] = ws
+        log.info(f"[WS CONNECT] client_id={client_id}  total_connected={len(self.active)}")
 
-    def build_command(self, prompt: str) -> list[str]:
-        n_predict = os.getenv("LLAMA_CLI_N_PREDICT", "256")
-        threads   = os.getenv("LLAMA_CLI_THREADS", "4")
-        ngl       = os.getenv("LLAMA_CLI_NGL", "99")
-        return [
-            str(self.wrapper_path),   # shell wrapper — sets LD_LIBRARY_PATH then execs llama-cli
-            "-m", str(self.model_path),
-            "-p", prompt,
-            "-n", n_predict,
-            "-t", threads,
-            "-ngl", ngl,
-            "--simple-io",
-            "--log-disable",
-            "--no-display-prompt",
-        ]
+    def disconnect(self, client_id: str):
+        ws = self.active.pop(client_id, None)
+        log.info(f"[WS DISCONNECT] client_id={client_id}  remaining={len(self.active)}")
+        return ws
 
-
-def _resolve_path(raw_path: str) -> Path:
-    path = Path(raw_path).expanduser()
-    return path if path.is_absolute() else (BASE_DIR / path).resolve()
-
-
-def _read_optional_timeout(name: str, default: float) -> float | None:
-    raw = os.getenv(name)
-    if not raw or not raw.strip():
-        val = default
-    else:
+    async def send_to(self, client_id: str, payload: dict) -> bool:
+        ws = self.active.get(client_id)
+        if ws is None:
+            log.warning(f"[WS SEND FAIL] client_id={client_id} not connected")
+            return False
         try:
-            val = float(raw)
-        except ValueError as e:
-            raise ValueError(f"{name} must be a number") from e
-    return None if val <= 0 else val
-
-
-def _shorten(text: str, limit: int = 2048) -> str:
-    return text if len(text) <= limit else f"{text[:limit]}...[+{len(text)-limit}]"
-
-
-def _run_llama_cli(command: list[str], timeout_seconds: float | None) -> subprocess.CompletedProcess[str]:
-    # No env= needed — wrapper script handles LD_LIBRARY_PATH
-    proc = subprocess.Popen(
-        command,
-        cwd=str(BASE_DIR),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    logger.info("llama-cli pid=%s", proc.pid)
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        stdout, stderr = proc.communicate()
-        raise subprocess.TimeoutExpired(proc.args, timeout_seconds)
-
-    return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
-
-
-# ── App factory ─────────────────────────────────────────────────────────────
-
-def create_app(config: ServerConfig | None = None) -> FastAPI:
-    runtime_config = config or ServerConfig.from_env()
-
-    _tasks: dict[str, dict] = {}
-    # max_workers=1 → one inference at a time (GPU can only run one llama-cli process)
-    _executor = ThreadPoolExecutor(max_workers=1)
-
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        # startup
-        ok = True
-        if not runtime_config.llama_cli_path.exists():
-            logger.error("startup: llama-cli not found: %s", runtime_config.llama_cli_path)
-            ok = False
-        if not runtime_config.model_path.exists():
-            logger.error("startup: model not found: %s", runtime_config.model_path)
-            ok = False
-        if not runtime_config.wrapper_path.exists():
-            logger.error("startup: wrapper not found: %s", runtime_config.wrapper_path)
-            ok = False
-        app.state.ready = ok
-        logger.info("startup done ready=%s wrapper=%s", ok, runtime_config.wrapper_path)
-        yield
-        # shutdown
-        _executor.shutdown(wait=False)
-        logger.info("executor shut down")
-
-    app = FastAPI(
-        title="HiSLM Inference Server — AGX Orin",
-        version="1.2.0",
-        lifespan=lifespan,
-    )
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    def _run_inference_background(task_id: str, prompt: str) -> None:
-        t0 = perf_counter()
-        _tasks[task_id] = {"status": "running"}
-        try:
-            cmd = runtime_config.build_command(prompt)
-            logger.info("task=%s inference start cmd=%s", task_id, " ".join(cmd))
-            completed = _run_llama_cli(cmd, runtime_config.timeout_seconds)
-            latency_ms = round((perf_counter() - t0) * 1000, 2)
-
-            if completed.returncode != 0:
-                err = (completed.stderr or "").strip()
-                logger.error("task=%s failed rc=%s err=%s", task_id, completed.returncode, _shorten(err))
-                _tasks[task_id] = {"status": "failed", "error": err or "inference failed", "latency_ms": latency_ms}
-            else:
-                text = (completed.stdout or "").strip()
-                logger.info("task=%s done len=%d latency_ms=%.0f", task_id, len(text), latency_ms)
-                _tasks[task_id] = {"status": "completed", "response": text, "latency_ms": latency_ms}
-
-        except subprocess.TimeoutExpired:
-            logger.warning("task=%s timed out", task_id)
-            _tasks[task_id] = {"status": "failed", "error": "inference timed out"}
+            await ws.send_text(json.dumps(payload))
+            log.debug(f"[WS SEND OK] → {client_id}  payload_type={payload.get('type')}")
+            return True
         except Exception as exc:
-            logger.exception("task=%s unexpected error", task_id)
-            _tasks[task_id] = {"status": "failed", "error": str(exc)}
+            log.error(f"[WS SEND ERROR] → {client_id}: {exc}")
+            self.active.pop(client_id, None)
+            return False
 
-    @app.post("/query")
-    async def query(payload: QueryRequest) -> dict:
-        prompt = payload.prompt.strip()
-        if not prompt:
-            raise HTTPException(422, "prompt must not be empty")
-        if not getattr(app.state, "ready", False):
-            raise HTTPException(503, "server not ready — check model/binary paths")
+    async def broadcast(self, payload: dict, exclude: Optional[str] = None):
+        targets = [cid for cid in list(self.active.keys()) if cid != exclude]
+        log.debug(f"[WS BROADCAST] payload_type={payload.get('type')}  targets={targets}")
+        for cid in targets:
+            await self.send_to(cid, payload)
 
-        logger.info("query prompt_chars=%d sensor=%s", len(prompt),
-                    json.dumps(payload.sensor, ensure_ascii=True, default=str))
+manager = ConnectionManager()
 
-        task_id = str(uuid.uuid4())
-        _tasks[task_id] = {"status": "queued"}
-        asyncio.get_running_loop().run_in_executor(_executor, _run_inference_background, task_id, prompt)
-        return {"status": "ok", "task_id": task_id}
+# ─────────────────────────────────────────────
+# FastAPI app
+# ─────────────────────────────────────────────
+app = FastAPI(title="HiSLM Node Messenger", version="1.0.0")
 
-    @app.get("/result/{task_id}")
-    async def get_result(task_id: str) -> dict:
-        task = _tasks.get(task_id)
-        if task is None:
-            raise HTTPException(404, "task not found")
-        return task
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    @app.post("/ack/{task_id}")
-    async def ack(task_id: str) -> dict:
-        task = _tasks.get(task_id)
-        if task is None:
-            raise HTTPException(404, "task not found")
-        status = task.get("status", "unknown")
-        logger.info("ack task=%s status=%s from %s", task_id, status, "client")
-        return {"status": "acknowledged", "task_id": task_id, "task_status": status}
+# Serve static files (UI) if the folder exists
+STATIC_DIR = Path(__file__).parent / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    log.info(f"[STATIC] Serving files from {STATIC_DIR}")
 
-    @app.get("/health")
-    async def health() -> dict:
-        return {"status": "ok" if getattr(app.state, "ready", False) else "not_ready"}
+# ─────────────────────────────────────────────
+# Endpoints
+# ─────────────────────────────────────────────
 
-    @app.get("/status")
-    async def status() -> dict:
-        counts = {"queued": 0, "running": 0, "completed": 0, "failed": 0}
-        for t in _tasks.values():
-            s = t.get("status", "unknown")
-            counts[s] = counts.get(s, 0) + 1
-        return {"ready": getattr(app.state, "ready", False), **counts}
-
-    return app
+@app.get("/health")
+async def health():
+    log.debug("[HEALTH] ping received")
+    return {
+        "status": "ok",
+        "node": "AGX-Orin-30GB",
+        "connected_clients": len(manager.active),
+        "message_count": len(message_history),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
-app = create_app()
+@app.get("/messages")
+async def get_messages(limit: int = 50):
+    """REST: fetch last N messages (for clients that can't use WS)."""
+    log.info(f"[GET /messages] limit={limit}")
+    return {"messages": message_history[-limit:]}
 
 
-def main() -> None:
-    import uvicorn
-    uvicorn.run(
-        "server:app",
-        host=os.getenv("SERVER_HOST", "0.0.0.0"),
-        port=int(os.getenv("SERVER_PORT", "8000")),
-        reload=False,
-        log_level=os.getenv("UVICORN_LOG_LEVEL", "info"),
+@app.post("/send")
+async def send_message(req: SendRequest):
+    """
+    REST: post a message.
+    The message is stored and broadcast to all connected WS clients.
+    """
+    log.info(f"[POST /send] sender={req.sender!r}  text={req.text[:80]!r}")
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="text must not be empty")
+
+    role = "server" if req.sender.lower() in ("agx", "server", "agx-orin") else "user"
+    msg = make_message(sender=req.sender, role=role, text=req.text.strip())
+
+    # Push to all WebSocket clients
+    await manager.broadcast({"type": "message", "payload": msg})
+    log.info(f"[POST /send] broadcast done  id={msg['id']}")
+    return {"ok": True, "message": msg}
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket, client_id: str = "anon"):
+    """
+    WebSocket endpoint.
+    Query param: ws://host:8000/ws?client_id=nx-node-1
+    
+    Protocol (JSON frames):
+      Client → Server:
+        { "type": "message",  "sender": "nx", "text": "hello" }
+        { "type": "ping" }
+      
+      Server → Client:
+        { "type": "message",  "payload": <Message dict> }
+        { "type": "history",  "payload": [<Message>, ...] }
+        { "type": "pong" }
+        { "type": "ack",      "id": "..." }
+        { "type": "connected","client_id": "..." }
+    """
+    await manager.connect(client_id, ws)
+
+    # Send message history on connect
+    history_payload = {"type": "history", "payload": message_history[-MAX_HISTORY:]}
+    await ws.send_text(json.dumps(history_payload))
+    log.info(f"[WS] Sent history ({len(message_history)} msgs) → {client_id}")
+
+    # Notify client of successful connection
+    await ws.send_text(json.dumps({
+        "type": "connected",
+        "client_id": client_id,
+        "node": "AGX-Orin-30GB",
+    }))
+
+    # Notify all others that someone joined
+    system_msg = make_message(
+        sender="system",
+        role="system",
+        text=f"[{client_id}] connected",
     )
+    await manager.broadcast({"type": "message", "payload": system_msg}, exclude=client_id)
+
+    try:
+        while True:
+            raw = await asyncio.wait_for(ws.receive_text(), timeout=PING_INTERVAL + 5)
+            log.debug(f"[WS RECV] from={client_id}  raw={raw[:120]!r}")
+
+            try:
+                frame = json.loads(raw)
+            except json.JSONDecodeError:
+                log.warning(f"[WS BAD JSON] from={client_id}")
+                await ws.send_text(json.dumps({"type": "error", "detail": "invalid JSON"}))
+                continue
+
+            ftype = frame.get("type", "")
+
+            if ftype == "ping":
+                await ws.send_text(json.dumps({"type": "pong"}))
+                log.debug(f"[WS PING/PONG] {client_id}")
+
+            elif ftype == "message":
+                text = (frame.get("text") or "").strip()
+                sender = frame.get("sender") or client_id
+                if not text:
+                    log.warning(f"[WS MSG] empty text from {client_id}, ignoring")
+                    continue
+
+                role = "server" if sender.lower() in ("agx", "server", "agx-orin") else "user"
+                msg = make_message(sender=sender, role=role, text=text)
+
+                # Ack back to sender
+                await ws.send_text(json.dumps({"type": "ack", "id": msg["id"]}))
+                # Broadcast to everyone else
+                await manager.broadcast(
+                    {"type": "message", "payload": msg},
+                    exclude=client_id,
+                )
+                log.info(f"[WS MSG] stored + broadcast  id={msg['id']}")
+
+            else:
+                log.warning(f"[WS UNKNOWN] type={ftype!r} from={client_id}")
+
+    except asyncio.TimeoutError:
+        log.warning(f"[WS TIMEOUT] no frame from {client_id} in {PING_INTERVAL+5}s → closing")
+    except WebSocketDisconnect as exc:
+        log.info(f"[WS DISCONNECT] {client_id} code={exc.code}")
+    except Exception as exc:
+        log.error(f"[WS ERROR] {client_id}: {exc}", exc_info=True)
+    finally:
+        manager.disconnect(client_id)
+        leave_msg = make_message(
+            sender="system",
+            role="system",
+            text=f"[{client_id}] disconnected",
+        )
+        await manager.broadcast({"type": "message", "payload": leave_msg})
+        log.info(f"[WS CLEANUP] {client_id} fully removed")
 
 
+@app.get("/", response_class=HTMLResponse)
+async def serve_ui():
+    """Serve the chat UI (inline so no separate static dir is needed)."""
+    ui_path = Path(__file__).parent / "static" / "index.html"
+    if ui_path.exists():
+        log.debug("[UI] Serving from file")
+        return HTMLResponse(content=ui_path.read_text())
+    log.debug("[UI] Serving inline fallback HTML")
+    return HTMLResponse(content=INLINE_HTML)
+
+
+# ─────────────────────────────────────────────
+# Inline fallback UI (used if static/index.html absent)
+# ─────────────────────────────────────────────
+INLINE_HTML = """<!DOCTYPE html>
+<html><head><title>HiSLM Node Chat</title></head>
+<body style="font-family:monospace;padding:2rem;background:#0d0d0d;color:#e0e0e0">
+<h2>HiSLM Node Messenger</h2>
+<p>Place <strong>static/index.html</strong> next to server.py for the full UI.</p>
+<p>Server is running on <strong>port 8000</strong>.</p>
+<p><a href="/health" style="color:#4af">Health check</a></p>
+</body></html>"""
+
+
+# ─────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    log.info("=" * 60)
+    log.info("  HiSLM Node Messenger — AGX Orin (Server)")
+    log.info(f"  Listening on http://{HOST}:{PORT}")
+    log.info(f"  Open UI at http://<AGX_IP>:{PORT}/")
+    log.info("=" * 60)
+
+    uvicorn.run(
+        app,
+        host=HOST,
+        port=PORT,
+        log_level="info",
+        ws_ping_interval=PING_INTERVAL,
+        ws_ping_timeout=30,
+    )
