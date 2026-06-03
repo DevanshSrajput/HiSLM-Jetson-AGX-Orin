@@ -201,8 +201,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         task_id = str(uuid.uuid4())
         _tasks[task_id] = {"status": "queued"}
 
-        loop = asyncio.get_event_loop()
-        loop.run_in_executor(_executor, _run_inference_background, task_id, prompt)
+        asyncio.get_running_loop().run_in_executor(_executor, _run_inference_background, task_id, prompt)
 
         return {"status": "ok", "task_id": task_id}
 
