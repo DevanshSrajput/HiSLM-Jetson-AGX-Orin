@@ -230,6 +230,15 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(404, "task not found")
         return task
 
+    @app.post("/ack/{task_id}")
+    async def ack(task_id: str) -> dict:
+        task = _tasks.get(task_id)
+        if task is None:
+            raise HTTPException(404, "task not found")
+        status = task.get("status", "unknown")
+        logger.info("ack task=%s status=%s from %s", task_id, status, "client")
+        return {"status": "acknowledged", "task_id": task_id, "task_status": status}
+
     @app.get("/health")
     async def health() -> dict:
         return {"status": "ok" if getattr(app.state, "ready", False) else "not_ready"}
