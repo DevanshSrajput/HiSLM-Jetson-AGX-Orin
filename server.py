@@ -5,12 +5,14 @@ import json
 import logging
 import os
 import subprocess
+import uuid
 import datetime
 from typing import Optional
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -148,8 +150,32 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    @app.post("/query", response_model=QueryResponse)
-    async def query(payload: QueryRequest) -> QueryResponse:
+    _tasks: dict[str, dict] = {}
+    _executor = ThreadPoolExecutor(max_workers=1)
+
+    def _run_inference_background(task_id: str, prompt: str) -> None:
+        _tasks[task_id] = {"status": "running"}
+        try:
+            command = runtime_config.build_command(prompt)
+            logger.info("inference task=%s starting llama-cli", task_id)
+            completed = _run_llama_cli(command, runtime_config.timeout_seconds)
+            if completed.returncode != 0:
+                stderr = (completed.stderr or "").strip()
+                logger.error("inference task=%s failed returncode=%s", task_id, completed.returncode)
+                _tasks[task_id] = {"status": "failed", "error": stderr or "inference failed"}
+            else:
+                response_text = (completed.stdout or "").rstrip("\r\n")
+                _tasks[task_id] = {"status": "completed", "response": response_text}
+                logger.info("inference task=%s completed len=%d", task_id, len(response_text))
+        except subprocess.TimeoutExpired:
+            logger.warning("inference task=%s timed out", task_id)
+            _tasks[task_id] = {"status": "failed", "error": "inference timed out"}
+        except Exception as exc:
+            logger.exception("inference task=%s failed unexpectedly", task_id)
+            _tasks[task_id] = {"status": "failed", "error": str(exc)}
+
+    @app.post("/query")
+    async def query(payload: QueryRequest) -> dict:
         prompt = payload.prompt.strip()
         if not prompt:
             raise HTTPException(status_code=422, detail="prompt must not be empty")
@@ -172,65 +198,20 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 detail=f"model file not found: {runtime_config.model_path}",
             )
 
-        command = runtime_config.build_command(prompt)
-        started_at = perf_counter()
-        start_dt = datetime.datetime.utcnow()
-        last_inference = getattr(app.state, "last_inference", None) or {}
-        last_inference.update({"started_at": start_dt.isoformat(), "status": "running"})
-        app.state.last_inference = last_inference
+        task_id = str(uuid.uuid4())
+        _tasks[task_id] = {"status": "queued"}
 
-        logger.info("invoking llama-cli; cmd=%s", " ".join(map(str, command)))
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(_executor, _run_inference_background, task_id, prompt)
 
-        try:
-            completed = await asyncio.to_thread(
-                _run_llama_cli,
-                command,
-                runtime_config.timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as exc:
-            logger.warning(
-                "llama-cli timed out after %.2fs",
-                runtime_config.timeout_seconds,
-            )
-            raise HTTPException(status_code=504, detail="inference timed out") from exc
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=500, detail="llama-cli binary is not executable") from exc
-        except OSError as exc:
-            logger.exception("failed to launch llama-cli")
-            raise HTTPException(status_code=500, detail="failed to launch inference process") from exc
-        finally:
-            # record end timestamp in any case
-            end_dt = datetime.datetime.utcnow()
-            last_inference = getattr(app.state, "last_inference", None) or {}
-            last_inference.update({"ended_at": end_dt.isoformat()})
-            app.state.last_inference = last_inference
+        return {"status": "ok", "task_id": task_id}
 
-        latency_ms = (perf_counter() - started_at) * 1000.0
-
-        last_inference = getattr(app.state, "last_inference", None) or {}
-        last_inference.update({"duration_ms": latency_ms})
-
-        if completed.returncode != 0:
-            stderr_text = (completed.stderr or "").strip()
-            logger.error("llama-cli returncode=%s stderr_len=%d", completed.returncode, len(stderr_text))
-            if stderr_text:
-                logger.error("llama-cli failed: %s", _shorten(stderr_text))
-            last_inference.update({"status": "failed", "stderr_len": len(stderr_text)})
-            app.state.last_inference = last_inference
-            raise HTTPException(status_code=502, detail="inference failed")
-
-        response_text = (completed.stdout or "").rstrip("\r\n")
-        logger.info(
-            "request completed latency_ms=%.2f stdout_len=%d stderr_len=%d",
-            latency_ms,
-            len(response_text),
-            len(completed.stderr or ""),
-        )
-
-        last_inference.update({"status": "ok", "response_len": len(response_text)})
-        app.state.last_inference = last_inference
-
-        return QueryResponse(response=response_text, latency_ms=latency_ms)
+    @app.get("/result/{task_id}")
+    async def get_result(task_id: str) -> dict:
+        task = _tasks.get(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        return task
 
     @app.on_event("startup")
     async def _startup_checks() -> None:
