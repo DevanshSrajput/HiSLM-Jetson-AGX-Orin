@@ -17,11 +17,14 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
 import uuid
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -54,6 +57,15 @@ HOST = "0.0.0.0"
 PORT = 8000
 MAX_HISTORY = 200          # messages kept in memory
 PING_INTERVAL = 20         # WebSocket keepalive ping interval (seconds)
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_MODEL_PATH = BASE_DIR / "qwen2.5-3b-instruct-q4_k_m.gguf"
+DEFAULT_LLAMA_RUNNER = BASE_DIR / "run_llama.sh"
+
+LLAMA_SYSTEM_PROMPT = (
+    "You are HiSLM running on the AGX Orin. Reply directly to the NX client's "
+    "question in a concise, useful way. Do not include hidden reasoning, logs, "
+    "or prompt text."
+)
 
 # ─────────────────────────────────────────────
 # Data models
@@ -87,6 +99,145 @@ def make_message(sender: str, role: str, text: str) -> dict:
         message_history.pop(0)
     log.info(f"[MSG STORED] sender={sender} role={role} text={text[:80]!r}")
     return msg
+
+# ─────────────────────────────────────────────
+# llama.cpp / Qwen responder
+# ─────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class LlamaConfig:
+    runner_path: Path
+    model_path: Path
+    timeout_seconds: float | None = 300.0
+    n_predict: str = "256"
+    threads: str = "4"
+    ctx_size: str = "4096"
+    gpu_layers: str = "auto"
+
+    @classmethod
+    def from_env(cls) -> "LlamaConfig":
+        return cls(
+            runner_path=_resolve_path(os.getenv("LLAMA_RUNNER", str(DEFAULT_LLAMA_RUNNER))),
+            model_path=_resolve_path(os.getenv("MODEL_PATH", str(DEFAULT_MODEL_PATH))),
+            timeout_seconds=_read_optional_timeout("LLAMA_TIMEOUT_SECONDS", 300.0),
+            n_predict=os.getenv("LLAMA_N_PREDICT", "256"),
+            threads=os.getenv("LLAMA_THREADS", "4"),
+            ctx_size=os.getenv("LLAMA_CTX_SIZE", "4096"),
+            gpu_layers=os.getenv("LLAMA_GPU_LAYERS", "auto"),
+        )
+
+    def validate(self) -> list[str]:
+        errors: list[str] = []
+        if not self.runner_path.exists():
+            errors.append(f"llama runner not found: {self.runner_path}")
+        if not self.model_path.exists():
+            errors.append(f"Qwen model not found: {self.model_path}")
+        return errors
+
+    def build_command(self, prompt: str) -> list[str]:
+        return [
+            str(self.runner_path),
+            "-m", str(self.model_path),
+            "-sys", LLAMA_SYSTEM_PROMPT,
+            "-p", prompt,
+            "-n", self.n_predict,
+            "-t", self.threads,
+            "-c", self.ctx_size,
+            "-ngl", self.gpu_layers,
+            "--single-turn",
+            "--simple-io",
+            "--no-display-prompt",
+            "--no-show-timings",
+            "--log-disable",
+        ]
+
+
+def _resolve_path(raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if path.is_absolute():
+        return path
+    return (BASE_DIR / path).resolve()
+
+
+def _read_optional_timeout(name: str, default: float) -> float | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        value = default
+    else:
+        try:
+            value = float(raw)
+        except ValueError:
+            log.warning("[%s] invalid value %r, using %.1fs", name, raw, default)
+            value = default
+    return None if value <= 0 else value
+
+
+llama_config = LlamaConfig.from_env()
+llama_executor = ThreadPoolExecutor(max_workers=1)
+
+
+def run_llama_reply(question: str) -> str:
+    errors = llama_config.validate()
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+    command = llama_config.build_command(question)
+    log.info("[LLAMA] starting Qwen2.5-3B response prompt_chars=%d", len(question))
+    completed = subprocess.run(
+        command,
+        cwd=str(BASE_DIR),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=llama_config.timeout_seconds,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        raise RuntimeError(stderr or f"llama-cli exited with code {completed.returncode}")
+
+    reply = clean_llama_stdout(completed.stdout or "")
+    if not reply:
+        raise RuntimeError("llama-cli returned an empty response")
+    log.info("[LLAMA] completed response_chars=%d", len(reply))
+    return reply
+
+
+def clean_llama_stdout(stdout: str) -> str:
+    lines = stdout.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    answer_lines: list[str] = []
+    saw_prompt = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("> "):
+            saw_prompt = True
+            answer_lines.clear()
+            continue
+        if not saw_prompt:
+            continue
+        if stripped == "Exiting...":
+            break
+        answer_lines.append(line)
+
+    reply = "\n".join(answer_lines).strip()
+    return reply or stdout.strip()
+
+
+async def generate_and_broadcast_reply(question: str):
+    loop = asyncio.get_running_loop()
+    try:
+        reply = await loop.run_in_executor(llama_executor, run_llama_reply, question)
+    except subprocess.TimeoutExpired:
+        log.warning("[LLAMA] inference timed out")
+        reply = "Qwen inference timed out before I could finish the reply."
+    except Exception as exc:
+        log.error("[LLAMA] inference failed: %s", exc, exc_info=True)
+        reply = f"Qwen inference failed on AGX: {exc}"
+
+    msg = make_message(sender="agx-qwen2.5-3b", role="server", text=reply)
+    await manager.broadcast({"type": "message", "payload": msg})
 
 # ─────────────────────────────────────────────
 # WebSocket connection manager
@@ -152,11 +303,16 @@ if STATIC_DIR.exists():
 @app.get("/health")
 async def health():
     log.debug("[HEALTH] ping received")
+    llama_errors = llama_config.validate()
     return {
         "status": "ok",
         "node": "AGX-Orin-30GB",
         "connected_clients": len(manager.active),
         "message_count": len(message_history),
+        "llama_ready": not llama_errors,
+        "llama_model": str(llama_config.model_path),
+        "llama_runner": str(llama_config.runner_path),
+        "llama_errors": llama_errors,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -183,6 +339,8 @@ async def send_message(req: SendRequest):
 
     # Push to all WebSocket clients
     await manager.broadcast({"type": "message", "payload": msg})
+    if role != "server":
+        asyncio.create_task(generate_and_broadcast_reply(msg["text"]))
     log.info(f"[POST /send] broadcast done  id={msg['id']}")
     return {"ok": True, "message": msg}
 
@@ -262,6 +420,8 @@ async def websocket_endpoint(ws: WebSocket, client_id: str = "anon"):
                     {"type": "message", "payload": msg},
                     exclude=client_id,
                 )
+                if role != "server":
+                    asyncio.create_task(generate_and_broadcast_reply(msg["text"]))
                 log.info(f"[WS MSG] stored + broadcast  id={msg['id']}")
 
             else:

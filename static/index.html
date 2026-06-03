@@ -201,8 +201,8 @@
     to   { opacity:1; transform: translateY(0); }
   }
 
-  .msg-row.from-agx { align-self: flex-start; }
-  .msg-row.from-nx  { align-self: flex-end; }
+  .msg-row.from-nx  { align-self: flex-start; }
+  .msg-row.from-agx { align-self: flex-end; }
   .msg-row.from-system {
     align-self: center;
     max-width: 90%;
@@ -218,8 +218,8 @@
     gap: 8px;
     align-items: center;
   }
-  .msg-row.from-nx .msg-meta  { justify-content: flex-end; }
-  .msg-row.from-agx .msg-meta { padding-left: 2px; }
+  .msg-row.from-agx .msg-meta { justify-content: flex-end; }
+  .msg-row.from-nx .msg-meta  { padding-left: 2px; }
 
   .msg-sender { font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; }
   .from-agx .msg-sender { color: var(--agx-col); }
@@ -239,16 +239,16 @@
   .from-agx .msg-bubble {
     background: var(--bg3);
     border: 1px solid var(--border);
-    border-left: 2px solid var(--agx-col);
+    border-right: 2px solid var(--agx-col);
     color: var(--text-hi);
-    box-shadow: -2px 0 8px rgba(0,255,157,0.08);
+    box-shadow: 2px 0 8px rgba(0,255,157,0.08);
   }
   .from-nx .msg-bubble {
     background: rgba(0,200,255,0.06);
     border: 1px solid rgba(0,200,255,0.2);
-    border-right: 2px solid var(--nx-col);
+    border-left: 2px solid var(--nx-col);
     color: var(--text-hi);
-    box-shadow: 2px 0 8px rgba(0,200,255,0.08);
+    box-shadow: -2px 0 8px rgba(0,200,255,0.08);
   }
   .from-system .msg-bubble {
     background: none;
@@ -894,7 +894,7 @@ function renderMessage(msg) {
   if (isOwnMessage) row.classList.add('own');
 
   const ts = formatTime(msg.timestamp);
-  const senderLabel = isAGX ? '▶ AGX-ORIN' : `◀ ${sender.toUpperCase()}`;
+  const senderLabel = isAGX ? 'AGX-ORIN ▶' : `◀ ${sender.toUpperCase()}`;
 
   row.innerHTML = `
     <div class="msg-meta">
