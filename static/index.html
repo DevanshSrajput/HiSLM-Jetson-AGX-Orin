@@ -682,23 +682,28 @@ const reconnBar    = document.getElementById('reconnect-bar');
 const nodeIdDisp   = document.getElementById('display-node-id');
 
 // ─────────────────────────────────────────────
-// Init — read URL params (client_id, host)
+// Init — read URL params (client_id, host, role)
 // ─────────────────────────────────────────────
 (function initFromUrl() {
   const p = new URLSearchParams(window.location.search);
-  if (p.get('client_id')) cfName.value = p.get('client_id');
-
-  // If opened from AGX (same host), auto-fill the host
   const currentHost = window.location.hostname;
-  cfHost.value = currentHost || '';
+  const currentPort = window.location.port || '8000';
 
-  // Auto-connect if all params present
+  // Always fill host/port from where the page was served
+  cfHost.value = currentHost || '';
+  cfPort.value = currentPort;
+
+  // Fill name + role from URL params if present
+  if (p.get('client_id')) cfName.value = p.get('client_id');
+  if (p.get('role'))      cfRole.value = p.get('role');
+
+  // Auto-connect (skip modal) when client_id is in URL — covers both
+  // the server opening localhost?client_id=agx-operator&role=agx
+  // and the NX opening http://agx-ip?client_id=nx-node
   if (p.get('client_id') && currentHost) {
-    // small delay so UI renders first
-    setTimeout(doConnect, 300);
-  } else {
-    // show modal
+    setTimeout(doConnect, 300);   // slight delay so the UI paints first
   }
+  // Otherwise leave the modal open for manual entry
 })();
 
 // ─────────────────────────────────────────────
