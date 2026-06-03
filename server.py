@@ -18,7 +18,10 @@ import json
 import logging
 import os
 import sys
+import threading
+import time
 import uuid
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -308,12 +311,35 @@ INLINE_HTML = """<!DOCTYPE html>
 # ─────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────
+def _open_browser_when_ready(port: int, delay: float = 1.5):
+    """
+    Wait briefly for uvicorn to bind, then open the UI in the local browser.
+    Runs in a daemon thread so it doesn't block the server.
+    """
+    time.sleep(delay)
+    url = f"http://localhost:{port}/?client_id=agx-operator&role=agx"
+    log.info(f"[BROWSER] Opening UI → {url}")
+    try:
+        webbrowser.open(url)
+    except Exception as exc:
+        log.warning(f"[BROWSER] Could not open browser automatically: {exc}")
+        log.info(f"[BROWSER] Open manually: {url}")
+
+
 if __name__ == "__main__":
     log.info("=" * 60)
     log.info("  HiSLM Node Messenger — AGX Orin (Server)")
     log.info(f"  Listening on http://{HOST}:{PORT}")
-    log.info(f"  Open UI at http://<AGX_IP>:{PORT}/")
+    log.info(f"  UI will auto-open at http://localhost:{PORT}/")
     log.info("=" * 60)
+
+    # Open the browser in the background after uvicorn is up
+    t = threading.Thread(
+        target=_open_browser_when_ready,
+        args=(PORT,),
+        daemon=True,
+    )
+    t.start()
 
     uvicorn.run(
         app,
