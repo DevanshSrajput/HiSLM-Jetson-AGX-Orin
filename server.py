@@ -6,11 +6,8 @@ import logging
 import os
 import subprocess
 import uuid
-import datetime
-from typing import Optional
 from dataclasses import dataclass
 from pathlib import Path
-from time import perf_counter
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor
 
@@ -36,11 +33,6 @@ class QueryRequest(BaseModel):
 
     prompt: str = Field(min_length=1)
     sensor: dict[str, Any] | None = None
-
-
-class QueryResponse(BaseModel):
-    response: str
-    latency_ms: float
 
 
 @dataclass(frozen=True)
@@ -100,12 +92,6 @@ def _read_optional_timeout(name: str, default: float) -> float | None:
     if timeout_value <= 0:
         return None
     return timeout_value
-
-
-def _shorten(text: str, limit: int = 4096) -> str:
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}... [truncated {len(text) - limit} chars]"
 
 
 def _run_llama_cli(command: list[str], timeout_seconds: float | None) -> subprocess.CompletedProcess[str]:
