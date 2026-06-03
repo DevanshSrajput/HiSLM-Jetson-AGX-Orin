@@ -1,0 +1,1001 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>HiSLM Node Messenger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<style>
+  :root {
+    --bg:        #080c10;
+    --bg2:       #0d1318;
+    --bg3:       #121a20;
+    --border:    #1e2d38;
+    --border-hi: #2a4050;
+    --accent:    #00c8ff;
+    --accent2:   #00ff9d;
+    --warn:      #ff6b35;
+    --dim:       #3a5060;
+    --text:      #c8dde8;
+    --text-hi:   #e8f4fa;
+    --text-dim:  #5a7888;
+    --agx-col:   #00ff9d;
+    --nx-col:    #00c8ff;
+    --sys-col:   #3a5060;
+    --font-mono: 'Share Tech Mono', monospace;
+    --font-ui:   'Rajdhani', sans-serif;
+    --r:         4px;
+    --glow:      0 0 12px rgba(0,200,255,0.25);
+    --glow2:     0 0 18px rgba(0,255,157,0.2);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-ui);
+    font-size: 15px;
+    letter-spacing: 0.02em;
+    overflow: hidden;
+  }
+
+  /* scanline overlay */
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.08) 2px,
+      rgba(0,0,0,0.08) 4px
+    );
+    pointer-events: none;
+    z-index: 9999;
+    opacity: 0.4;
+  }
+
+  /* ── Layout ─────────────────────────────── */
+  #app {
+    display: grid;
+    grid-template-rows: 56px 1fr auto;
+    height: 100vh;
+  }
+
+  /* ── Header ─────────────────────────────── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 20px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    position: relative;
+    z-index: 10;
+  }
+
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .logo-mark {
+    width: 30px; height: 30px;
+    display: grid;
+    place-items: center;
+  }
+  .logo-mark svg { width: 100%; height: 100%; }
+
+  .title-block h1 {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--accent);
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+  }
+  .title-block p {
+    font-size: 11px;
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    letter-spacing: 0.08em;
+  }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+  }
+
+  /* Status indicators */
+  .status-chips {
+    display: flex;
+    gap: 10px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+  }
+  .chip {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    color: var(--text-dim);
+    transition: all .3s;
+  }
+  .chip.online  { border-color: var(--accent2); color: var(--accent2); }
+  .chip.offline { border-color: var(--warn);    color: var(--warn);    }
+  .dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    animation: blink 2s infinite;
+  }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+  /* Node ID display */
+  #node-id-display {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-dim);
+  }
+  #node-id-display span {
+    color: var(--accent);
+  }
+
+  /* ── Message area ────────────────────────── */
+  #messages-wrap {
+    overflow: hidden;
+    position: relative;
+    background: var(--bg);
+  }
+
+  /* corner brackets decoration */
+  #messages-wrap::before,
+  #messages-wrap::after {
+    content: '';
+    position: absolute;
+    width: 20px; height: 20px;
+    pointer-events: none;
+    z-index: 5;
+  }
+  #messages-wrap::before {
+    top: 0; left: 0;
+    border-top: 1px solid var(--border-hi);
+    border-left: 1px solid var(--border-hi);
+  }
+  #messages-wrap::after {
+    top: 0; right: 0;
+    border-top: 1px solid var(--border-hi);
+    border-right: 1px solid var(--border-hi);
+  }
+
+  #messages {
+    height: 100%;
+    overflow-y: auto;
+    padding: 16px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    scroll-behavior: smooth;
+  }
+
+  /* custom scrollbar */
+  #messages::-webkit-scrollbar { width: 4px; }
+  #messages::-webkit-scrollbar-track { background: var(--bg); }
+  #messages::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 2px; }
+
+  /* ── Message rows ────────────────────────── */
+  .msg-row {
+    display: flex;
+    flex-direction: column;
+    max-width: 72%;
+    animation: fadeUp .18s ease-out;
+  }
+  @keyframes fadeUp {
+    from { opacity:0; transform: translateY(6px); }
+    to   { opacity:1; transform: translateY(0); }
+  }
+
+  .msg-row.from-agx { align-self: flex-start; }
+  .msg-row.from-nx  { align-self: flex-end; }
+  .msg-row.from-system {
+    align-self: center;
+    max-width: 90%;
+    opacity: 0.5;
+  }
+
+  .msg-meta {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--text-dim);
+    margin-bottom: 3px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .msg-row.from-nx .msg-meta  { justify-content: flex-end; }
+  .msg-row.from-agx .msg-meta { padding-left: 2px; }
+
+  .msg-sender { font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; }
+  .from-agx .msg-sender { color: var(--agx-col); }
+  .from-nx  .msg-sender { color: var(--nx-col); }
+
+  .msg-bubble {
+    padding: 9px 13px;
+    border-radius: var(--r);
+    font-size: 14px;
+    line-height: 1.55;
+    font-family: var(--font-ui);
+    font-weight: 500;
+    word-break: break-word;
+    position: relative;
+  }
+
+  .from-agx .msg-bubble {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--agx-col);
+    color: var(--text-hi);
+    box-shadow: -2px 0 8px rgba(0,255,157,0.08);
+  }
+  .from-nx .msg-bubble {
+    background: rgba(0,200,255,0.06);
+    border: 1px solid rgba(0,200,255,0.2);
+    border-right: 2px solid var(--nx-col);
+    color: var(--text-hi);
+    box-shadow: 2px 0 8px rgba(0,200,255,0.08);
+  }
+  .from-system .msg-bubble {
+    background: none;
+    border: none;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--sys-col);
+    padding: 2px 0;
+    letter-spacing: 0.06em;
+  }
+
+  /* "own" message glow */
+  .msg-row.own .msg-bubble {
+    box-shadow: var(--glow);
+  }
+
+  /* ── Spacer when empty ───────────────────── */
+  #empty-state {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 10px;
+    opacity: 0.25;
+    pointer-events: none;
+  }
+  #empty-state .es-icon {
+    font-size: 32px;
+    font-family: var(--font-mono);
+    color: var(--accent);
+    letter-spacing: -4px;
+  }
+  #empty-state p {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--dim);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+
+  /* ── Input bar ───────────────────────────── */
+  #input-bar {
+    background: var(--bg2);
+    border-top: 1px solid var(--border);
+    padding: 12px 20px;
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+    position: relative;
+  }
+
+  /* role toggle */
+  #role-toggle {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 60px;
+  }
+  #role-toggle label {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--text-dim);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  #role-select {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 5px 8px;
+    border-radius: var(--r);
+    cursor: pointer;
+    outline: none;
+    transition: border-color .2s;
+  }
+  #role-select:focus { border-color: var(--accent); }
+
+  /* name input */
+  #name-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 100px;
+  }
+  #name-wrap label {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--text-dim);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  #sender-name {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 5px 8px;
+    border-radius: var(--r);
+    outline: none;
+    width: 100%;
+    transition: border-color .2s;
+  }
+  #sender-name:focus { border-color: var(--accent); }
+
+  /* text input */
+  #input-wrap {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  #input-wrap label {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--text-dim);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  #msg-input {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    color: var(--text-hi);
+    font-family: var(--font-ui);
+    font-size: 14px;
+    font-weight: 500;
+    padding: 8px 12px;
+    border-radius: var(--r);
+    resize: none;
+    outline: none;
+    min-height: 38px;
+    max-height: 120px;
+    line-height: 1.4;
+    transition: border-color .2s, box-shadow .2s;
+  }
+  #msg-input:focus {
+    border-color: var(--accent);
+    box-shadow: var(--glow);
+  }
+  #msg-input::placeholder { color: var(--text-dim); }
+
+  /* send button */
+  #send-btn {
+    align-self: flex-end;
+    background: none;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 8px 16px;
+    border-radius: var(--r);
+    cursor: pointer;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    transition: all .2s;
+    white-space: nowrap;
+    height: 38px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  #send-btn:hover {
+    background: rgba(0,200,255,0.1);
+    box-shadow: var(--glow);
+  }
+  #send-btn:active { transform: scale(0.97); }
+  #send-btn:disabled {
+    border-color: var(--dim);
+    color: var(--dim);
+    cursor: not-allowed;
+  }
+
+  /* key hint */
+  .key-hint {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--text-dim);
+    text-align: right;
+    margin-top: 3px;
+    letter-spacing: 0.06em;
+  }
+
+  /* ── Reconnect overlay ───────────────────── */
+  #reconnect-bar {
+    display: none;
+    position: fixed;
+    top: 56px; left: 0; right: 0;
+    background: rgba(255,107,53,0.12);
+    border-bottom: 1px solid var(--warn);
+    padding: 6px 20px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--warn);
+    text-align: center;
+    z-index: 20;
+    animation: slideDown .2s ease;
+  }
+  #reconnect-bar.visible { display: block; }
+  @keyframes slideDown { from{transform:translateY(-100%)} to{transform:translateY(0)} }
+
+  /* ── Connection modal ────────────────────── */
+  #connect-modal {
+    position: fixed; inset: 0;
+    background: rgba(8,12,16,0.92);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    backdrop-filter: blur(4px);
+  }
+  #connect-modal.hidden { display: none; }
+
+  .modal-box {
+    background: var(--bg2);
+    border: 1px solid var(--border-hi);
+    border-radius: 6px;
+    padding: 32px 36px;
+    width: 340px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.6), var(--glow);
+    animation: modalIn .25s ease-out;
+  }
+  @keyframes modalIn { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:none} }
+
+  .modal-box h2 {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--accent);
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+  .modal-box p {
+    font-size: 13px;
+    color: var(--text-dim);
+    margin-bottom: 24px;
+    line-height: 1.5;
+  }
+
+  .form-field {
+    margin-bottom: 16px;
+  }
+  .form-field label {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--text-dim);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    margin-bottom: 5px;
+  }
+  .form-field input, .form-field select {
+    width: 100%;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    color: var(--text-hi);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    padding: 9px 12px;
+    border-radius: var(--r);
+    outline: none;
+    transition: border-color .2s;
+  }
+  .form-field input:focus, .form-field select:focus {
+    border-color: var(--accent);
+    box-shadow: var(--glow);
+  }
+
+  #connect-btn {
+    width: 100%;
+    margin-top: 8px;
+    background: rgba(0,200,255,0.08);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    padding: 11px;
+    border-radius: var(--r);
+    cursor: pointer;
+    transition: all .2s;
+  }
+  #connect-btn:hover {
+    background: rgba(0,200,255,0.18);
+    box-shadow: var(--glow);
+  }
+
+  .modal-note {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--text-dim);
+    margin-top: 14px;
+    text-align: center;
+    letter-spacing: 0.06em;
+  }
+</style>
+</head>
+<body>
+
+<!-- Connection modal -->
+<div id="connect-modal">
+  <div class="modal-box">
+    <h2>// Node Messenger</h2>
+    <p>Configure your connection to the AGX Orin server.</p>
+
+    <div class="form-field">
+      <label>Server IP / Host</label>
+      <input id="cf-host" type="text" placeholder="172.16.6.21" value=""/>
+    </div>
+    <div class="form-field">
+      <label>Port</label>
+      <input id="cf-port" type="number" placeholder="8000" value="8000"/>
+    </div>
+    <div class="form-field">
+      <label>Your Name / Node ID</label>
+      <input id="cf-name" type="text" placeholder="nx-node-1"/>
+    </div>
+    <div class="form-field">
+      <label>Role</label>
+      <select id="cf-role">
+        <option value="nx">NX  (child node)</option>
+        <option value="agx">AGX (server operator)</option>
+      </select>
+    </div>
+
+    <button id="connect-btn">Connect →</button>
+    <p class="modal-note">Both devices open the same URL. Server node selects AGX role.</p>
+  </div>
+</div>
+
+<!-- Reconnect banner -->
+<div id="reconnect-bar">⚠ Connection lost — reconnecting…</div>
+
+<!-- App shell -->
+<div id="app">
+
+  <header>
+    <div class="header-left">
+      <div class="logo-mark">
+        <svg viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="1" y="1" width="28" height="28" rx="2" stroke="#1e2d38" stroke-width="1"/>
+          <path d="M6 15 L12 9 L18 15 L24 9" stroke="#00c8ff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M6 21 L12 15 L18 21 L24 15" stroke="#00ff9d" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.6"/>
+          <circle cx="15" cy="15" r="2" fill="#00c8ff" opacity="0.4"/>
+        </svg>
+      </div>
+      <div class="title-block">
+        <h1>HiSLM // Node Messenger</h1>
+        <p id="subtitle">AGX-Orin ↔ NX — LAN Channel</p>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="status-chips">
+        <div class="chip" id="ws-chip"><div class="dot"></div><span id="ws-label">WS</span></div>
+        <div class="chip" id="srv-chip"><div class="dot"></div><span>SERVER</span></div>
+      </div>
+      <div id="node-id-display">NODE: <span id="display-node-id">—</span></div>
+    </div>
+  </header>
+
+  <div id="messages-wrap">
+    <div id="messages">
+      <div id="empty-state">
+        <div class="es-icon">{ }</div>
+        <p>No messages yet</p>
+      </div>
+    </div>
+  </div>
+
+  <div id="input-bar">
+    <div id="name-wrap">
+      <label>Sender ID</label>
+      <input id="sender-name" type="text" placeholder="node-name" readonly/>
+    </div>
+    <div id="role-toggle">
+      <label>Role</label>
+      <select id="role-select">
+        <option value="nx">NX</option>
+        <option value="agx">AGX</option>
+      </select>
+    </div>
+    <div id="input-wrap">
+      <label>Message</label>
+      <textarea id="msg-input" rows="1" placeholder="Type a message… (Ctrl+Enter to send)"></textarea>
+      <div class="key-hint">Ctrl+Enter to send</div>
+    </div>
+    <button id="send-btn" disabled>
+      <span>SEND</span>
+      <span>▶</span>
+    </button>
+  </div>
+
+</div>
+
+<script>
+// ─────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────
+let ws = null;
+let wsUrl = '';
+let baseUrl = '';
+let clientName = 'unknown';
+let clientRole = 'nx';   // 'nx' | 'agx'
+let reconnectTimer = null;
+let pingTimer = null;
+let seenIds = new Set();
+let isConnected = false;
+
+// ─────────────────────────────────────────────
+// DOM refs
+// ─────────────────────────────────────────────
+const modal        = document.getElementById('connect-modal');
+const connectBtn   = document.getElementById('connect-btn');
+const cfHost       = document.getElementById('cf-host');
+const cfPort       = document.getElementById('cf-port');
+const cfName       = document.getElementById('cf-name');
+const cfRole       = document.getElementById('cf-role');
+const messagesDiv  = document.getElementById('messages');
+const emptyState   = document.getElementById('empty-state');
+const msgInput     = document.getElementById('msg-input');
+const sendBtn      = document.getElementById('send-btn');
+const senderName   = document.getElementById('sender-name');
+const roleSelect   = document.getElementById('role-select');
+const wsChip       = document.getElementById('ws-chip');
+const wsLabel      = document.getElementById('ws-label');
+const srvChip      = document.getElementById('srv-chip');
+const reconnBar    = document.getElementById('reconnect-bar');
+const nodeIdDisp   = document.getElementById('display-node-id');
+
+// ─────────────────────────────────────────────
+// Init — read URL params (client_id, host)
+// ─────────────────────────────────────────────
+(function initFromUrl() {
+  const p = new URLSearchParams(window.location.search);
+  if (p.get('client_id')) cfName.value = p.get('client_id');
+
+  // If opened from AGX (same host), auto-fill the host
+  const currentHost = window.location.hostname;
+  cfHost.value = currentHost || '';
+
+  // Auto-connect if all params present
+  if (p.get('client_id') && currentHost) {
+    // small delay so UI renders first
+    setTimeout(doConnect, 300);
+  } else {
+    // show modal
+  }
+})();
+
+// ─────────────────────────────────────────────
+// Connect logic
+// ─────────────────────────────────────────────
+connectBtn.addEventListener('click', doConnect);
+
+function doConnect() {
+  const host = cfHost.value.trim() || window.location.hostname;
+  const port = cfPort.value.trim() || '8000';
+  clientName = cfName.value.trim() || 'unknown';
+  clientRole = cfRole.value;
+
+  baseUrl = `http://${host}:${port}`;
+  wsUrl   = `ws://${host}:${port}/ws?client_id=${encodeURIComponent(clientName)}`;
+
+  senderName.value = clientName;
+  roleSelect.value = clientRole;
+  nodeIdDisp.textContent = clientName;
+
+  modal.classList.add('hidden');
+  openWS();
+}
+
+// ─────────────────────────────────────────────
+// WebSocket
+// ─────────────────────────────────────────────
+function openWS() {
+  if (ws) { try { ws.close(); } catch(_){} }
+  log('WS', `Connecting → ${wsUrl}`);
+  setWsStatus('connecting');
+
+  ws = new WebSocket(wsUrl);
+
+  ws.addEventListener('open', () => {
+    log('WS', 'Connected');
+    isConnected = true;
+    setWsStatus('online');
+    setSrvStatus('online');
+    reconnBar.classList.remove('visible');
+    sendBtn.disabled = false;
+    clearTimeout(reconnectTimer);
+    startPing();
+  });
+
+  ws.addEventListener('message', (ev) => {
+    let frame;
+    try { frame = JSON.parse(ev.data); } catch(e) { return; }
+    handleFrame(frame);
+  });
+
+  ws.addEventListener('close', (ev) => {
+    log('WS', `Closed code=${ev.code}`);
+    isConnected = false;
+    setWsStatus('offline');
+    sendBtn.disabled = true;
+    stopPing();
+    scheduleReconnect();
+  });
+
+  ws.addEventListener('error', (ev) => {
+    log('WS', `Error: ${ev}`);
+    setWsStatus('offline');
+  });
+}
+
+function sendFrame(frame) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(frame));
+    log('SEND', JSON.stringify(frame).slice(0,80));
+  } else {
+    log('SEND FAIL', 'WS not open, falling back to REST');
+    restSend(frame.sender, frame.text);
+  }
+}
+
+function scheduleReconnect() {
+  reconnBar.classList.add('visible');
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    log('WS', 'Reconnecting…');
+    openWS();
+  }, 3000);
+}
+
+function startPing() {
+  stopPing();
+  pingTimer = setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({type:'ping'}));
+    }
+  }, 15000);
+}
+function stopPing() {
+  clearInterval(pingTimer);
+}
+
+// ─────────────────────────────────────────────
+// Frame handler
+// ─────────────────────────────────────────────
+function handleFrame(frame) {
+  const t = frame.type;
+
+  if (t === 'history') {
+    const msgs = frame.payload || [];
+    log('HISTORY', `${msgs.length} messages`);
+    msgs.forEach(m => renderMessage(m));
+    scrollToBottom();
+    return;
+  }
+
+  if (t === 'connected') {
+    log('CONNECTED', `as ${frame.client_id} on ${frame.node}`);
+    setSrvStatus('online');
+    return;
+  }
+
+  if (t === 'message') {
+    const msg = frame.payload;
+    if (!seenIds.has(msg.id)) {
+      seenIds.add(msg.id);
+      renderMessage(msg);
+      scrollToBottom();
+    }
+    return;
+  }
+
+  if (t === 'ack') {
+    log('ACK', `id=${frame.id}`);
+    return;
+  }
+
+  if (t === 'pong') { return; }
+
+  if (t === 'error') {
+    log('SERVER ERR', frame.detail);
+    return;
+  }
+
+  log('UNKNOWN FRAME', JSON.stringify(frame));
+}
+
+// ─────────────────────────────────────────────
+// REST fallback send
+// ─────────────────────────────────────────────
+async function restSend(sender, text) {
+  log('REST SEND', `sender=${sender} text=${text.slice(0,50)}`);
+  try {
+    const r = await fetch(`${baseUrl}/send`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ sender, text }),
+    });
+    const data = await r.json();
+    log('REST SEND OK', JSON.stringify(data).slice(0,80));
+  } catch(e) {
+    log('REST SEND FAIL', e.toString());
+  }
+}
+
+// ─────────────────────────────────────────────
+// Render message
+// ─────────────────────────────────────────────
+function renderMessage(msg) {
+  if (!msg || !msg.id) return;
+
+  // Remove empty state
+  if (emptyState.parentNode) emptyState.remove();
+
+  const role = msg.role;   // 'server' | 'user' | 'system'
+  const sender = msg.sender || '?';
+
+  const row = document.createElement('div');
+  row.className = 'msg-row';
+  row.dataset.id = msg.id;
+
+  if (role === 'system') {
+    row.classList.add('from-system');
+    row.innerHTML = `<div class="msg-bubble">${escHtml(msg.text)}</div>`;
+    messagesDiv.appendChild(row);
+    return;
+  }
+
+  const isAGX = (role === 'server');
+  const isOwnMessage = (sender === clientName);
+
+  row.classList.add(isAGX ? 'from-agx' : 'from-nx');
+  if (isOwnMessage) row.classList.add('own');
+
+  const ts = formatTime(msg.timestamp);
+  const senderLabel = isAGX ? '▶ AGX-ORIN' : `◀ ${sender.toUpperCase()}`;
+
+  row.innerHTML = `
+    <div class="msg-meta">
+      <span class="msg-sender">${escHtml(senderLabel)}</span>
+      <span>${ts}</span>
+    </div>
+    <div class="msg-bubble">${escHtml(msg.text)}</div>
+  `;
+
+  messagesDiv.appendChild(row);
+}
+
+function scrollToBottom() {
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+// ─────────────────────────────────────────────
+// Send button / input
+// ─────────────────────────────────────────────
+sendBtn.addEventListener('click', sendMessage);
+
+msgInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && e.ctrlKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+  // Auto-grow
+  setTimeout(() => {
+    msgInput.style.height = 'auto';
+    msgInput.style.height = Math.min(msgInput.scrollHeight, 120) + 'px';
+  }, 0);
+});
+
+roleSelect.addEventListener('change', () => {
+  clientRole = roleSelect.value;
+});
+
+function sendMessage() {
+  const text = msgInput.value.trim();
+  if (!text) return;
+
+  const senderVal = senderName.value.trim() || clientName;
+  const role = roleSelect.value;
+
+  // Optimistically render own message
+  const tempId = 'temp-' + Date.now();
+  const tempMsg = {
+    id: tempId,
+    sender: senderVal,
+    role: role === 'agx' ? 'server' : 'user',
+    text,
+    timestamp: new Date().toISOString(),
+  };
+  seenIds.add(tempId);
+  renderMessage(tempMsg);
+  scrollToBottom();
+
+  sendFrame({
+    type: 'message',
+    sender: senderVal,
+    text,
+  });
+
+  msgInput.value = '';
+  msgInput.style.height = 'auto';
+  log('SEND MSG', `sender=${senderVal} role=${role} text=${text.slice(0,60)}`);
+}
+
+// ─────────────────────────────────────────────
+// Status UI helpers
+// ─────────────────────────────────────────────
+function setWsStatus(state) {
+  wsChip.className = 'chip';
+  if (state === 'online')      { wsChip.classList.add('online'); wsLabel.textContent = 'WS ✓'; }
+  else if (state === 'offline'){ wsChip.classList.add('offline'); wsLabel.textContent = 'WS ✗'; }
+  else                          { wsLabel.textContent = 'WS …'; }
+}
+function setSrvStatus(state) {
+  srvChip.className = 'chip';
+  if (state === 'online') srvChip.classList.add('online');
+  else srvChip.classList.add('offline');
+}
+
+// ─────────────────────────────────────────────
+// Utils
+// ─────────────────────────────────────────────
+function log(tag, msg) {
+  const ts = new Date().toISOString().slice(11,23);
+  console.log(`[${ts}] [${tag}] ${msg}`);
+}
+
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+function formatTime(iso) {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  } catch(_) { return iso.slice(11,19); }
+}
+</script>
+</body>
+</html>
