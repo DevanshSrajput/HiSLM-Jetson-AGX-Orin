@@ -65,12 +65,16 @@ class ServerConfig:
         )
 
     def build_command(self, prompt: str) -> list[str]:
+        n_predict = os.getenv("LLAMA_CLI_N_PREDICT", "256")
+        threads = os.getenv("LLAMA_CLI_THREADS", "4")
         return [
             str(self.llama_cli_path),
             "-m",
             str(self.model_path),
             "-p",
             prompt,
+            "-n", n_predict,
+            "-t", threads,
             "--simple-io",
             "--log-disable",
         ]
