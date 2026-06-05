@@ -330,11 +330,32 @@ def _open_browser_when_ready(port: int, delay: float = 1.5):
 
 
 if __name__ == "__main__":
+    import socket as _socket
+
+    # Resolve actual LAN IP when bound to 0.0.0.0
+    if HOST in ("0.0.0.0", ""):
+        try:
+            with _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM) as _s:
+                _s.connect(("8.8.8.8", 80))
+                _actual_ip = _s.getsockname()[0]
+        except Exception:
+            _actual_ip = "127.0.0.1"
+    else:
+        _actual_ip = HOST
+
     log.info("=" * 60)
     log.info(f"  HiSLM Node Messenger — {NODE_NAME}")
-    log.info(f"  Listening on http://{HOST}:{PORT}")
-    log.info(f"  UI will auto-open at http://localhost:{PORT}/")
+    log.info(f"  Bind address : {HOST}:{PORT}")
+    log.info(f"  LAN access   : http://{_actual_ip}:{PORT}")
+    log.info(f"  Local access : http://localhost:{PORT}/")
     log.info("=" * 60)
+
+    print("\n" + "=" * 60)
+    print(f"  HiSLM Node Messenger — {NODE_NAME}")
+    print(f"  IP   : {_actual_ip}")
+    print(f"  Port : {PORT}")
+    print(f"  URL  : http://{_actual_ip}:{PORT}")
+    print("=" * 60 + "\n")
 
     if not _args.no_browser:
         t = threading.Thread(
