@@ -265,6 +265,48 @@
     box-shadow: var(--glow);
   }
 
+  /* ── Thinking / SLM-typing indicator ────────── */
+  .thinking-bubble .msg-bubble {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 56px;
+    padding: 10px 14px;
+  }
+  .thinking-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--agx-col);
+    opacity: 0.6;
+    animation: tdot 1.2s infinite ease-in-out;
+  }
+  .thinking-dot:nth-child(2) { animation-delay: .2s; }
+  .thinking-dot:nth-child(3) { animation-delay: .4s; }
+  @keyframes tdot {
+    0%,80%,100% { transform: scale(0.7); opacity: 0.35; }
+    40%         { transform: scale(1.15); opacity: 1; }
+  }
+  .thinking-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 0.08em;
+    margin-left: 4px;
+  }
+
+  /* SLM mode badge in header */
+  .slm-badge {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    padding: 2px 7px;
+    border-radius: 2px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  .slm-badge.forward { border: 1px solid var(--accent2); color: var(--accent2); }
+  .slm-badge.local   { border: 1px solid var(--accent);  color: var(--accent); }
+  .slm-badge.off     { border: 1px solid var(--dim);     color: var(--dim); }
+
   /* ── Spacer when empty ───────────────────── */
   #empty-state {
     flex: 1;
@@ -609,6 +651,7 @@
         <div class="chip" id="srv-chip"><div class="dot"></div><span>SERVER</span></div>
       </div>
       <div id="node-id-display">NODE: <span id="display-node-id">—</span></div>
+      <div id="slm-badge-wrap"></div>
     </div>
   </header>
 
@@ -680,6 +723,10 @@ const wsLabel      = document.getElementById('ws-label');
 const srvChip      = document.getElementById('srv-chip');
 const reconnBar    = document.getElementById('reconnect-bar');
 const nodeIdDisp   = document.getElementById('display-node-id');
+const slmBadgeWrap = document.getElementById('slm-badge-wrap');
+
+let thinkingRow    = null;   // the DOM element for the "..." bubble
+let pendingSince   = null;   // timestamp when thinking started
 
 // ─────────────────────────────────────────────
 // Init — read URL params (client_id, host, role)
@@ -761,6 +808,7 @@ function openWS() {
     setWsStatus('offline');
     sendBtn.disabled = true;
     stopPing();
+    removeThinking();
     scheduleReconnect();
   });
 
@@ -818,6 +866,14 @@ function handleFrame(frame) {
   if (t === 'connected') {
     log('CONNECTED', `as ${frame.client_id} on ${frame.node}`);
     setSrvStatus('online');
+
+    // Update subtitle with node name
+    const subtitle = document.getElementById('subtitle');
+    if (subtitle && frame.node) subtitle.textContent = `${frame.node} — Node Messenger`;
+
+    // Show SLM mode badge
+    const mode = frame.slm_mode || 'off';
+    slmBadgeWrap.innerHTML = `<span class="slm-badge ${mode}">SLM:${mode.toUpperCase()}</span>`;
     return;
   }
 
@@ -825,6 +881,10 @@ function handleFrame(frame) {
     const msg = frame.payload;
     if (!seenIds.has(msg.id)) {
       seenIds.add(msg.id);
+      // Server reply arrived → remove thinking bubble
+      if (msg.role === 'server' && msg.sender !== 'system') {
+        removeThinking();
+      }
       renderMessage(msg);
       scrollToBottom();
     }
@@ -894,7 +954,9 @@ function renderMessage(msg) {
   if (isOwnMessage) row.classList.add('own');
 
   const ts = formatTime(msg.timestamp);
-  const senderLabel = isAGX ? 'AGX-ORIN ▶' : `◀ ${sender.toUpperCase()}`;
+  // Show actual sender name — strip common suffixes for display
+  const displaySender = sender.replace(/-qwen[\d.]+b(-instruct)?(-q[\w]+)?/i, '').replace(/-+$/, '').toUpperCase() || sender.toUpperCase();
+  const senderLabel = isAGX ? `${displaySender} ▶` : `◀ ${displaySender}`;
 
   row.innerHTML = `
     <div class="msg-meta">
@@ -958,9 +1020,58 @@ function sendMessage() {
     text,
   });
 
+  // Show SLM thinking indicator only when user (NX) sends — not when AGX/server posts
+  if (role !== 'agx') {
+    showThinking();
+  }
+
   msgInput.value = '';
   msgInput.style.height = 'auto';
   log('SEND MSG', `sender=${senderVal} role=${role} text=${text.slice(0,60)}`);
+}
+
+// ─────────────────────────────────────────────
+// Thinking / SLM-pending indicator
+// ─────────────────────────────────────────────
+function showThinking() {
+  removeThinking();   // clear any stale one first
+  if (emptyState.parentNode) emptyState.remove();
+
+  thinkingRow = document.createElement('div');
+  thinkingRow.className = 'msg-row from-agx thinking-bubble';
+  thinkingRow.id = 'thinking-indicator';
+
+  pendingSince = Date.now();
+  thinkingRow.innerHTML = `
+    <div class="msg-meta">
+      <span class="msg-sender" style="color:var(--agx-col)">SLM ▶</span>
+      <span id="thinking-elapsed">0s</span>
+    </div>
+    <div class="msg-bubble">
+      <span class="thinking-dot"></span>
+      <span class="thinking-dot"></span>
+      <span class="thinking-dot"></span>
+      <span class="thinking-label">inferring…</span>
+    </div>
+  `;
+  messagesDiv.appendChild(thinkingRow);
+  scrollToBottom();
+
+  // Tick elapsed time so user knows it's alive
+  thinkingRow._ticker = setInterval(() => {
+    if (!thinkingRow || !thinkingRow.parentNode) return;
+    const el = document.getElementById('thinking-elapsed');
+    if (el) el.textContent = Math.floor((Date.now() - pendingSince) / 1000) + 's';
+  }, 1000);
+}
+
+function removeThinking() {
+  if (thinkingRow) {
+    clearInterval(thinkingRow._ticker);
+    thinkingRow.remove();
+    thinkingRow = null;
+    pendingSince = null;
+  }
 }
 
 // ─────────────────────────────────────────────

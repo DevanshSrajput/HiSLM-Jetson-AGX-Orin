@@ -73,3 +73,6 @@ torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl
 qwen2.5-3b-instruct-q4_k_m.gguf
 HiSLM-8GB-Nvidia-Orin-NX/
 llama.cpp/
+static/nx_index.html
+client2.py
+HISTORY_REPORT.md
