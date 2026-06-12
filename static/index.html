@@ -729,28 +729,25 @@ let thinkingRow    = null;   // the DOM element for the "..." bubble
 let pendingSince   = null;   // timestamp when thinking started
 
 // ─────────────────────────────────────────────
-// Init — read URL params (client_id, host, role)
+// Init — auto-connect to serving host
 // ─────────────────────────────────────────────
 (function initFromUrl() {
   const p = new URLSearchParams(window.location.search);
   const currentHost = window.location.hostname;
   const currentPort = window.location.port || '8000';
 
-  // Always fill host/port from where the page was served
   cfHost.value = currentHost || '';
   cfPort.value = currentPort;
 
-  // Fill name + role from URL params if present
   if (p.get('client_id')) cfName.value = p.get('client_id');
   if (p.get('role'))      cfRole.value = p.get('role');
 
-  // Auto-connect (skip modal) when client_id is in URL — covers both
-  // the server opening localhost?client_id=agx-operator&role=agx
-  // and the NX opening http://agx-ip?client_id=nx-node
-  if (p.get('client_id') && currentHost) {
-    setTimeout(doConnect, 300);   // slight delay so the UI paints first
-  }
-  // Otherwise leave the modal open for manual entry
+  // Default name + role when none provided
+  if (!cfName.value.trim()) cfName.value = 'agx-operator';
+  if (!cfRole.value)        cfRole.value = 'agx';
+
+  // Always auto-connect so the UI updates in real-time
+  setTimeout(doConnect, 300);
 })();
 
 // ─────────────────────────────────────────────
@@ -794,6 +791,7 @@ function openWS() {
     sendBtn.disabled = false;
     clearTimeout(reconnectTimer);
     startPing();
+    startPolling();
   });
 
   ws.addEventListener('message', (ev) => {
@@ -808,6 +806,7 @@ function openWS() {
     setWsStatus('offline');
     sendBtn.disabled = true;
     stopPing();
+    stopPolling();
     removeThinking();
     scheduleReconnect();
   });
@@ -847,6 +846,37 @@ function startPing() {
 }
 function stopPing() {
   clearInterval(pingTimer);
+}
+
+// ─────────────────────────────────────────────
+// Fallback message poll (catches WS misses)
+// ─────────────────────────────────────────────
+let pollTimer = null;
+let lastMessageId = null;
+
+function startPolling() {
+  stopPolling();
+  pollTimer = setInterval(async () => {
+    try {
+      const r = await fetch(`${baseUrl}/messages?limit=10`);
+      const data = await r.json();
+      const msgs = data.messages || [];
+      for (const m of msgs) {
+        if (m.id && !seenIds.has(m.id)) {
+          seenIds.add(m.id);
+          if (m.role === 'server' && m.sender !== 'system') {
+            removeThinking();
+          }
+          renderMessage(m);
+          scrollToBottom();
+        }
+      }
+    } catch (_) {}
+  }, 4000);
+}
+
+function stopPolling() {
+  clearInterval(pollTimer);
 }
 
 // ─────────────────────────────────────────────
@@ -1020,10 +1050,7 @@ function sendMessage() {
     text,
   });
 
-  // Show SLM thinking indicator only when user (NX) sends — not when AGX/server posts
-  if (role !== 'agx') {
-    showThinking();
-  }
+  showThinking();
 
   msgInput.value = '';
   msgInput.style.height = 'auto';

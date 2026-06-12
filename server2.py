@@ -156,14 +156,19 @@ class LlamaConfig:
             "-t", self.threads,
             "-c", self.ctx_size,
             "-ngl", self.gpu_layers,
-            "--flash-attn",
+            "--flash-attn", "auto",
             "--no-warmup",
             "--single-turn",
             "--simple-io",
+            "-e",
             "--no-display-prompt",
             "--no-show-timings",
             "--log-disable",
-        ]
+            "--repeat-penalty", "1.15",
+            "--temperature", "0.7",
+            "--top-k", "40",
+            "--top-p", "0.95",
+    ]
 
 def _resolve_path(raw_path: str) -> Path:
     path = Path(raw_path).expanduser()
@@ -212,7 +217,26 @@ def run_llama_reply(question: str) -> str:
     return reply
 
 def clean_llama_stdout(stdout: str) -> str:
-    return stdout.strip()
+    lines = stdout.splitlines()
+    out = []
+    capture = False
+    for line in lines:
+        if capture:
+            if line.strip() == "Exiting...":
+                break
+            out.append(line)
+        elif line.startswith("> "):
+            capture = True
+    while out and not out[0].strip():
+        out.pop(0)
+    reply = "\n".join(out).strip()
+    if not reply and "<|im_start|>assistant" in stdout:
+        idx = stdout.index("<|im_start|>assistant") + len("<|im_start|>assistant")
+        after = stdout[idx:].strip()
+        if "<|im_end|>" in after:
+            after = after[:after.index("<|im_end|>")]
+        reply = after.strip()
+    return reply
 
 async def generate_and_broadcast_reply(question: str):
     loop = asyncio.get_running_loop()
@@ -352,13 +376,16 @@ async def websocket_endpoint(ws: WebSocket, client_id: str = "anon"):
                     continue
                 role = "server" if sender.lower() in ("agx", "server", "agx-orin") else "user"
                 msg = make_message(sender=sender, role=role, text=text)
-                await ws.send_text(json.dumps({"type": "ack", "id": msg["id"]}))
+                if role != "server":
+                    asyncio.create_task(generate_and_broadcast_reply(msg["text"]))
+                try:
+                    await ws.send_text(json.dumps({"type": "ack", "id": msg["id"]}))
+                except Exception:
+                    log.warning(f"[WS ACK FAIL] {client_id}: ack send failed, continuing")
                 await manager.broadcast(
                     {"type": "message", "payload": msg},
                     exclude=client_id,
                 )
-                if role != "server":
-                    asyncio.create_task(generate_and_broadcast_reply(msg["text"]))
                 log.info(f"[WS MSG] stored + broadcast  id={msg['id']}")
             else:
                 log.warning(f"[WS UNKNOWN] type={ftype!r} from={client_id}")

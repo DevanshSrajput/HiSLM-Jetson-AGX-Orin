@@ -146,9 +146,14 @@ class LlamaConfig:
             "-ngl", self.gpu_layers,
             "--single-turn",
             "--simple-io",
+            "-e",
             "--no-display-prompt",
             "--no-show-timings",
             "--log-disable",
+            "--repeat-penalty", "1.15",
+            "--temperature", "0.7",
+            "--top-k", "40",
+            "--top-p", "0.95",
         ]
 
 
@@ -222,7 +227,13 @@ def clean_llama_stdout(stdout: str) -> str:
         answer_lines.append(line)
 
     reply = "\n".join(answer_lines).strip()
-    return reply or stdout.strip()
+    if not reply and "<|im_start|>assistant" in stdout:
+        idx = stdout.index("<|im_start|>assistant") + len("<|im_start|>assistant")
+        after = stdout[idx:].strip()
+        if "<|im_end|>" in after:
+            after = after[:after.index("<|im_end|>")]
+        reply = after.strip()
+    return reply
 
 
 async def generate_and_broadcast_reply(question: str):
